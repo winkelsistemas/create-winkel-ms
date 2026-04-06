@@ -1,0 +1,22 @@
+{
+    "name": "create-winkel-ms",
+    "version": "1.0.0",
+    "description": "CLI scaffolding tool for winkel-ms-starter-kit",
+    "bin": {
+        "create-winkel-ms": "./bin/run.js"
+    },
+    "scripts": {
+        "dev": "tsx src/index.ts",
+        "build": "tsc",
+        "start": "node dist/index.js"
+    },
+    "dependencies": {
+        "@clack/prompts": "^0.9.0",
+        "chalk": "^5.3.0"
+    },
+    "devDependencies": {
+        "@types/node": "^22.0.0",
+        "tsx": "^4.19.1",
+        "typescript": "^5.6.2"
+    }
+}
