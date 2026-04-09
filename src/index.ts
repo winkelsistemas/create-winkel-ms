@@ -20,6 +20,7 @@ interface Services {
     mongo: boolean;
     redis: boolean;
     rabbitmq: boolean;
+    grpc: boolean;
 }
 
 async function main(): Promise<void> {
@@ -69,6 +70,11 @@ async function main(): Promise<void> {
                 label: "RabbitMQ",
                 hint: "@winkel-arsenal/messagebroker  —  message broker",
             },
+            {
+                value: "grpc",
+                label: "gRPC",
+                hint: "@winkel-arsenal/grpc  —  gRPC server & client",
+            },
         ],
         required: false,
     });
@@ -83,6 +89,7 @@ async function main(): Promise<void> {
         mongo: (selected as string[]).includes("mongo"),
         redis: (selected as string[]).includes("redis"),
         rabbitmq: (selected as string[]).includes("rabbitmq"),
+        grpc: (selected as string[]).includes("grpc"),
     };
 
     const targetDir = path.resolve(process.cwd(), projectName);
@@ -116,6 +123,14 @@ async function main(): Promise<void> {
     s.start("Updating package.json...");
     updatePackageJson(targetDir, projectName, services);
     s.stop("package.json updated.");
+
+    if (!services.grpc) {
+        s.start("Removing gRPC from project...");
+        updateMainTs(targetDir);
+        updateApplicationComposer(targetDir);
+        removeGrpcControllers(targetDir);
+        s.stop("gRPC removed.");
+    }
 
     const noneSelected = !Object.values(services).some(Boolean);
 
@@ -284,7 +299,210 @@ function updatePackageJson(targetDir: string, projectName: string, services: Ser
         delete pkg.devDependencies?.["@types/amqplib"];
     }
 
+    if (!services.grpc) {
+        delete deps["@winkel-arsenal/grpc"];
+        delete deps["@grpc/grpc-js"];
+        delete deps["@grpc/proto-loader"];
+    }
+
     fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 4) + "\n", "utf-8");
+}
+
+function updateMainTs(targetDir: string): void {
+    const mainTsPath = path.join(targetDir, "src", "main.ts");
+    const content = `import HttpServerAdapterProvider from "@infra/http/HttpServerAdapterProvider";
+import { ApplicationComposer } from "@infra/setup/ApplicationComposer";
+import { Logger } from "@winkel-arsenal/core";
+import { HttpServer } from "@winkel-arsenal/http";
+import { environment } from "environment/env";
+
+environment.load();
+
+const server: HttpServer = new HttpServerAdapterProvider().execute();
+const applicationComposer: ApplicationComposer = new ApplicationComposer(server);
+
+applicationComposer.initialize().catch((err) => {
+    Logger.error("Error initializing the app:", err);
+    process.exit(1);
+});
+
+process.on("SIGTERM", async () => {
+    Logger.info("SIGTERM received, stopping server...");
+    await server.stop();
+    process.exit(0);
+});
+
+const port = Number(process.env.SERVER_PORT);
+server.listen(port);
+`;
+    fs.writeFileSync(mainTsPath, content, "utf-8");
+}
+
+function updateApplicationComposer(targetDir: string): void {
+    const composerPath = path.join(targetDir, "src", "infra", "setup", "ApplicationComposer.ts");
+    const content = `import CustomerResource from "@application/api/resource/CustomerResource";
+import UserAuthTemplateResource from "@application/api/resource/UserAuthTemplateResource";
+import CustomerUseCaseFactory from "@application/factory/CustomerUseCaseFactory";
+import UserAuthTemplateUseCaseFactory from "@application/factory/UserAuthTemplateUseCaseFactory";
+import LogPublisherService from "@application/service/LogPublisherService";
+import { ExchangeType, MessagePublisher, RabbitMQMessageBrokerFactory } from "@winkel-arsenal/messagebroker";
+import AuthenticationFactory from "@infra/factory/AuthenticationFactory";
+import CryptoFactory from "@infra/factory/CryptoFactory";
+import SessionFactory from "@infra/factory/SessionFactory";
+import LogConsumer from "@infra/messagebroker/LogConsumer";
+import { ValidateToken } from "@winkel-arsenal/auth";
+import { RequestContextClsHookAdapter } from "@winkel-arsenal/cls";
+import { DBClient, DBTransactionManager } from "@winkel-arsenal/database";
+import { PostgresDBConnection, PostgresDBConnectionFactory } from "@winkel-arsenal/postgres";
+import { RedisDBConnection, RedisDBConnectionFactory } from "@winkel-arsenal/redis";
+import CustomerController from "@infra/controller/CustomerController";
+import UserAuthTemplateController from "@infra/controller/UserAuthTemplateController";
+import { SQL_MODEL_NAME } from "@infra/database/SqlModelName";
+import DataBaseCustomerRepository from "@infra/repository/database/DataBaseCustomerRepository";
+import DataBaseUserRepository from "@infra/repository/database/DataBaseUserRepository";
+import MongoLogRepository from "@infra/repository/mongodb/MongoLogRepository";
+import RedisCustomerCacheRepository from "@infra/repository/redis/RedisCustomerCacheRepository";
+import RedisTokenCacheRepository from "@infra/repository/redis/RedisTokenCacheRepository";
+import { ActuatorController } from "@winkel-arsenal/actuator";
+import { ServerContext, Session } from "@winkel-arsenal/context-server";
+import { HttpServer } from "@winkel-arsenal/http";
+import { MongoClient } from "mongodb";
+
+class ApplicationComposer {
+    private readonly jose = CryptoFactory.createJose();
+    private readonly jwt = CryptoFactory.createJwt();
+    private readonly password = CryptoFactory.createPassword();
+    private readonly messagePublisher: MessagePublisher;
+    private logConsumer: LogConsumer | null = null;
+
+    constructor(private readonly server: HttpServer) {
+        const brokerFactory = new RabbitMQMessageBrokerFactory(process.env.RABBITMQ_URL ?? "", [
+            { name: "template.log.exchange", type: ExchangeType.TOPIC },
+        ]);
+        const broker = brokerFactory.create();
+        this.messagePublisher = new MessagePublisher(broker);
+    }
+
+    public async initialize(): Promise<void> {
+        this.initContext();
+        this.registerActuatorController();
+
+        const postgresDBConnection = await this.createPostgresDBConnection();
+        const dbClient = this.createDBClient(postgresDBConnection);
+        const mongoClient = await this.createMongoClient();
+        const redisConnection = this.createRedisConnection();
+
+        this.attachSession(postgresDBConnection);
+        this.attachAuthentication();
+
+        const logRepository = new MongoLogRepository(mongoClient);
+        const logPublisher = new LogPublisherService(this.messagePublisher);
+
+        this.logConsumer = new LogConsumer(
+            new RabbitMQMessageBrokerFactory(process.env.RABBITMQ_URL ?? "", [
+                { name: "template.log.exchange", type: ExchangeType.TOPIC },
+            ]).create(),
+            logRepository
+        );
+
+        this.registerCustomerController(dbClient, redisConnection, logPublisher);
+        this.registerUserAuthTemplateController(dbClient, redisConnection);
+
+        await this.logConsumer.start();
+    }
+
+    private initContext(): void {
+        ServerContext.createContext(new RequestContextClsHookAdapter("winkel-ms-template"));
+        this.server.use(ServerContext.initContext(this.server));
+    }
+
+    private async createPostgresDBConnection(): Promise<PostgresDBConnection> {
+        const postgresDBConnection = await PostgresDBConnectionFactory.create();
+        const dbTransactionManager = new DBTransactionManager();
+        postgresDBConnection.attach(dbTransactionManager);
+        return postgresDBConnection;
+    }
+
+    private createDBClient(postgresDBConnection: PostgresDBConnection): DBClient {
+        return new DBClient(postgresDBConnection);
+    }
+
+    private async createMongoClient(): Promise<MongoClient> {
+        const mongoUrl = process.env.MONGODB_URL ?? "mongodb://localhost:27017";
+        const client = new MongoClient(mongoUrl);
+        await client.connect();
+        return client;
+    }
+
+    private createRedisConnection(): RedisDBConnection {
+        return RedisDBConnectionFactory.create();
+    }
+
+    private attachSession(postgresDBConnection: PostgresDBConnection): void {
+        const session: Session = new SessionFactory().create();
+        this.server.use(session.start(postgresDBConnection));
+    }
+
+    private attachAuthentication(): void {
+        const authValidator = new AuthenticationFactory().create();
+        this.server.use(authValidator.authenticate(new ValidateToken(this.jwt)));
+    }
+
+    private registerActuatorController(): void {
+        new ActuatorController(this.server);
+    }
+
+    private registerCustomerController(
+        dbClient: DBClient,
+        redisConnection: RedisDBConnection,
+        logPublisher: LogPublisherService
+    ): void {
+        const customerRepository = new DataBaseCustomerRepository(dbClient);
+        const customerCache = new RedisCustomerCacheRepository(redisConnection);
+        const useCaseFactory = new CustomerUseCaseFactory(
+            customerRepository,
+            customerCache,
+            logPublisher
+        );
+        new CustomerController(this.server, new CustomerResource(useCaseFactory));
+    }
+
+    private registerUserAuthTemplateController(
+        dbClient: DBClient,
+        redisConnection: RedisDBConnection
+    ): void {
+        const userRepository = new DataBaseUserRepository(dbClient, SQL_MODEL_NAME.USER);
+        const tokenCache = new RedisTokenCacheRepository(redisConnection);
+        const useCaseFactory = new UserAuthTemplateUseCaseFactory(
+            userRepository,
+            this.jwt,
+            this.password,
+            this.jose,
+            tokenCache
+        );
+        new UserAuthTemplateController(this.server, new UserAuthTemplateResource(useCaseFactory));
+    }
+}
+
+export { ApplicationComposer };
+`;
+    fs.writeFileSync(composerPath, content, "utf-8");
+}
+
+function removeGrpcControllers(targetDir: string): void {
+    const controllersDir = path.join(targetDir, "src", "infra", "controller");
+    const grpcControllers = [
+        "ActuatorGrpcController.ts",
+        "CustomerGrpcController.ts",
+        "UserAuthTemplateGrpcController.ts",
+    ];
+
+    for (const file of grpcControllers) {
+        const filePath = path.join(controllersDir, file);
+        if (fs.existsSync(filePath)) {
+            fs.rmSync(filePath);
+        }
+    }
 }
 
 function selectedSummary(services: Services): string {
@@ -293,6 +511,7 @@ function selectedSummary(services: Services): string {
     lines.push(`  MongoDB      ${services.mongo ? "✔" : "✘"}`);
     lines.push(`  Redis        ${services.redis ? "✔" : "✘"}`);
     lines.push(`  RabbitMQ     ${services.rabbitmq ? "✔" : "✘"}`);
+    lines.push(`  gRPC         ${services.grpc ? "✔" : "✘"}`);
     return lines.join("\n");
 }
 
