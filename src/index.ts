@@ -529,7 +529,7 @@ function removeGrpcFiles(targetDir: string): void {
         path.join(targetDir, "src", "infra", "controller", "CustomerGrpcController.ts"),
         path.join(targetDir, "src", "infra", "controller", "UserAuthTemplateGrpcController.ts"),
         path.join(targetDir, "src", "infra", "controller", "ExternalServiceController.ts"),
-        path.join(targetDir, "src", "infra", "gateway", "GrpcExternalServiceGateway.ts"),
+        path.join(targetDir, "src", "infra", "gateway", "GrpcTestServiceGateway.ts"),
         path.join(targetDir, "src", "domain", "gateway", "ExternalServiceGateway.ts"),
         path.join(targetDir, "src", "proto", "test.proto"),
     ];
