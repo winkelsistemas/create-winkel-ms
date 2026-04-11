@@ -21,6 +21,7 @@ interface Services {
     redis: boolean;
     rabbitmq: boolean;
     grpc: boolean;
+    httpclient: boolean;
 }
 
 async function main(): Promise<void> {
@@ -75,6 +76,11 @@ async function main(): Promise<void> {
                 label: "gRPC",
                 hint: "@winkel-arsenal/grpc  —  gRPC server & client",
             },
+            {
+                value: "httpclient",
+                label: "HTTP Client",
+                hint: "@winkel-arsenal/httpclient  —  HTTP client for external APIs",
+            },
         ],
         required: false,
     });
@@ -90,6 +96,7 @@ async function main(): Promise<void> {
         redis: (selected as string[]).includes("redis"),
         rabbitmq: (selected as string[]).includes("rabbitmq"),
         grpc: (selected as string[]).includes("grpc"),
+        httpclient: (selected as string[]).includes("httpclient"),
     };
 
     const targetDir = path.resolve(process.cwd(), projectName);
@@ -127,9 +134,18 @@ async function main(): Promise<void> {
     if (!services.grpc) {
         s.start("Removing gRPC from project...");
         updateMainTs(targetDir);
-        updateApplicationComposer(targetDir);
+        updateApplicationComposer(targetDir, services.httpclient);
         removeGrpcControllers(targetDir);
         s.stop("gRPC removed.");
+    }
+
+    if (!services.httpclient) {
+        s.start("Removing HTTP client from project...");
+        removeHttpClientFiles(targetDir);
+        if (services.grpc) {
+            patchComposerRemoveHttpClient(targetDir);
+        }
+        s.stop("HTTP client removed.");
     }
 
     const noneSelected = !Object.values(services).some(Boolean);
@@ -305,6 +321,11 @@ function updatePackageJson(targetDir: string, projectName: string, services: Ser
         delete deps["@grpc/proto-loader"];
     }
 
+    if (!services.httpclient) {
+        delete deps["@winkel-arsenal/httpclient"];
+        delete deps["undici"];
+    }
+
     fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 4) + "\n", "utf-8");
 }
 
@@ -338,8 +359,28 @@ server.listen(port);
     fs.writeFileSync(mainTsPath, content, "utf-8");
 }
 
-function updateApplicationComposer(targetDir: string): void {
+function updateApplicationComposer(targetDir: string, includeHttpClient: boolean): void {
     const composerPath = path.join(targetDir, "src", "infra", "setup", "ApplicationComposer.ts");
+
+    const httpClientImports = includeHttpClient
+        ? `import AddressController from "@infra/controller/AddressController";
+import PostalCodeAddressGateway from "@infra/gateway/PostalCodeAddressGateway";
+`
+        : "";
+
+    const httpClientRegisterCall = includeHttpClient
+        ? `
+        this.registerAddressController();`
+        : "";
+
+    const httpClientRegisterMethod = includeHttpClient
+        ? `
+    private registerAddressController(): void {
+        new AddressController(this.server, new PostalCodeAddressGateway());
+    }
+`
+        : "";
+
     const content = `import CustomerResource from "@application/api/resource/CustomerResource";
 import UserAuthTemplateResource from "@application/api/resource/UserAuthTemplateResource";
 import CustomerUseCaseFactory from "@application/factory/CustomerUseCaseFactory";
@@ -363,7 +404,7 @@ import DataBaseUserRepository from "@infra/repository/database/DataBaseUserRepos
 import MongoLogRepository from "@infra/repository/mongodb/MongoLogRepository";
 import RedisCustomerCacheRepository from "@infra/repository/redis/RedisCustomerCacheRepository";
 import RedisTokenCacheRepository from "@infra/repository/redis/RedisTokenCacheRepository";
-import { ActuatorController } from "@winkel-arsenal/actuator";
+${httpClientImports}import { ActuatorController } from "@winkel-arsenal/actuator";
 import { ServerContext, Session } from "@winkel-arsenal/context-server";
 import { HttpServer } from "@winkel-arsenal/http";
 import { MongoClient } from "mongodb";
@@ -406,7 +447,7 @@ class ApplicationComposer {
         );
 
         this.registerCustomerController(dbClient, redisConnection, logPublisher);
-        this.registerUserAuthTemplateController(dbClient, redisConnection);
+        this.registerUserAuthTemplateController(dbClient, redisConnection);${httpClientRegisterCall}
 
         await this.logConsumer.start();
     }
@@ -482,7 +523,7 @@ class ApplicationComposer {
         );
         new UserAuthTemplateController(this.server, new UserAuthTemplateResource(useCaseFactory));
     }
-}
+${httpClientRegisterMethod}}
 
 export { ApplicationComposer };
 `;
@@ -505,6 +546,35 @@ function removeGrpcControllers(targetDir: string): void {
     }
 }
 
+function removeHttpClientFiles(targetDir: string): void {
+    const filesToRemove = [
+        path.join(targetDir, "src", "infra", "controller", "AddressController.ts"),
+        path.join(targetDir, "src", "infra", "gateway", "PostalCodeAddressGateway.ts"),
+        path.join(targetDir, "src", "domain", "gateway", "AddressGateway.ts"),
+    ];
+
+    for (const filePath of filesToRemove) {
+        if (fs.existsSync(filePath)) {
+            fs.rmSync(filePath);
+        }
+    }
+}
+
+function patchComposerRemoveHttpClient(targetDir: string): void {
+    const composerPath = path.join(targetDir, "src", "infra", "setup", "ApplicationComposer.ts");
+
+    if (!fs.existsSync(composerPath)) return;
+
+    let content = fs.readFileSync(composerPath, "utf-8");
+
+    content = content.replace(/^import AddressController from "@infra\/controller\/AddressController";\n/m, "");
+    content = content.replace(/^import PostalCodeAddressGateway from "@infra\/gateway\/PostalCodeAddressGateway";\n/m, "");
+    content = content.replace(/^\s+this\.registerAddressController\(\);\n/m, "");
+    content = content.replace(/\n\s+private registerAddressController\(\): void \{\n\s+new AddressController\(this\.server, new PostalCodeAddressGateway\(\)\);\n\s+\}\n/m, "\n");
+
+    fs.writeFileSync(composerPath, content, "utf-8");
+}
+
 function selectedSummary(services: Services): string {
     const lines = ["Infrastructure included:"];
     lines.push(`  PostgreSQL   ${services.postgres ? "✔" : "✘"}`);
@@ -512,6 +582,7 @@ function selectedSummary(services: Services): string {
     lines.push(`  Redis        ${services.redis ? "✔" : "✘"}`);
     lines.push(`  RabbitMQ     ${services.rabbitmq ? "✔" : "✘"}`);
     lines.push(`  gRPC         ${services.grpc ? "✔" : "✘"}`);
+    lines.push(`  HTTP Client  ${services.httpclient ? "✔" : "✘"}`);
     return lines.join("\n");
 }
 
