@@ -531,7 +531,7 @@ function removeGrpcFiles(targetDir: string): void {
         path.join(targetDir, "src", "infra", "controller", "ExternalServiceController.ts"),
         path.join(targetDir, "src", "infra", "gateway", "GrpcExternalServiceGateway.ts"),
         path.join(targetDir, "src", "domain", "gateway", "ExternalServiceGateway.ts"),
-        path.join(targetDir, "src", "proto", "health.proto"),
+        path.join(targetDir, "src", "proto", "test.proto"),
     ];
 
     for (const filePath of filesToRemove) {
